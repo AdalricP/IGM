@@ -48,31 +48,41 @@ Each box is one module; modules talk only through SQLite + a small in-process me
 
 ## 4. Browser harness
 
+We do **not** write a Playwright wrapper from scratch. We shell out to **`agent-browser`** (Playwright-based, agent-native CLI, installed at `/opt/homebrew/bin/agent-browser`). It already handles the things we'd otherwise reinvent: a persistent daemon so chained commands share browser state, accessibility-tree snapshots with ref handles for selector-resilient interaction, CDP attach, profile reuse, network interception, and encrypted state.
+
 ### 4.1 Connection mode
 
-Attach Playwright to a Chrome instance the user starts manually:
+Two options, in order of preference:
 
-```bash
-/Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome \
-  --remote-debugging-port=9222 \
-  --user-data-dir="$HOME/.ig-scrape-chrome-profile"
-```
+**A. Persistent profile (recommended for the burner).** Let `agent-browser` own a dedicated Chrome profile at `~/.ig-scrape-chrome-profile`. User logs into the secondary IG account once into that profile (`agent-browser --profile ~/.ig-scrape-chrome-profile open instagram.com`); session sticks. Subsequent runs reuse it.
 
-The user logs into the **secondary** IG account once in that Chrome window. Playwright connects via `browser = await playwright.chromium.connect_over_cdp("http://localhost:9222")`. Traffic looks indistinguishable from manual browsing — same TLS fingerprint, same Chrome version, same cookies, same extensions.
+**B. CDP attach to an already-running Chrome.** User starts Chrome with `--remote-debugging-port=9222 --user-data-dir=~/.ig-scrape-chrome-profile`; the crawler calls `agent-browser connect 9222 …`. Useful if the user wants to keep the window visible/manageable.
 
-Tradeoff: that Chrome window is "owned" by the crawler while running; user shouldn't browse IG in it concurrently.
+Both eliminate `navigator.webdriver` (agent-browser uses Playwright with CDP, never `webdriver-flagged` launch) and give us real Chrome's TLS/UA/extensions. Tradeoff: the profile is "owned" by the crawler; don't browse IG in it concurrently.
 
 ### 4.2 Anti-detection layer
 
-Even with real Chrome, IG fingerprints behavioral patterns. Mitigations:
+`agent-browser` gives us realistic input by default; we still need to enforce *patterns* that look human. Mitigations:
 
-- **No `webdriver` flag** — CDP-attach avoids the `navigator.webdriver` tell that `playwright.launch()` sets.
-- **Human input** — every interaction goes through a small `human.py` helper:
-  - `human.click(locator)` → mouse-move along bezier curve to element, dwell 200-800ms, click
-  - `human.scroll(distance)` → wheel events with momentum, not `scrollTo`
-  - `human.type(text)` → keystrokes with 80-220ms jitter
-- **Read-don't-click where possible** — extract from DOM rather than clicking through. Less interaction = less surface to fingerprint.
-- **Viewport/UA**: inherited from real Chrome, so no spoofing needed.
+- **Snapshot-driven selectors.** `agent-browser snapshot -i` returns the interactive accessibility tree with `@e1`/`@e2`/… refs. We click/fill by ref, not brittle CSS, which also means we don't have to thrash selectors when IG ships UI updates.
+- **Human pacing** lives in our Python orchestrator (§4.3), not in `agent-browser`. Each interaction is followed by a jittered delay drawn from a log-normal distribution.
+- **Read-don't-click where possible.** Extract from the accessibility tree (`get text @e1`, `get attr @e1 href`) rather than clicking through. Less interaction = less surface to fingerprint.
+- **Network-side detection** uses `agent-browser network requests --filter '/api/'` to observe XHR responses for 429/challenge without writing a CDP listener.
+- **Viewport/UA**: inherited from real Chrome via the profile, so no spoofing needed.
+
+### 4.2.1 Operator's mental model
+
+Each page adapter (followers list, profile, suggestions panel) is a short shell pipeline against `agent-browser`. The Python orchestrator calls these via `subprocess.run`, parses the JSON output (`AGENT_BROWSER_JSON=1`), enforces pacing, and writes to SQLite. Concretely the suggestion-panel adapter looks like:
+
+```bash
+agent-browser open "instagram.com/$USERNAME" \
+  && agent-browser wait 'h2:has-text("Followers")' \
+  && agent-browser snapshot -i --filter "suggestions" \
+  && agent-browser click "@$CHEVRON_REF" \
+  && agent-browser snapshot -i --filter "user cards"
+```
+
+The orchestrator interleaves these calls with jittered sleeps and checkpoint detection.
 
 ### 4.3 Pacing
 
@@ -94,10 +104,11 @@ Total realistic candidates added per day: ~30 (one run) to ~90 (three runs) depe
 
 ### 4.4 Checkpoint / rate-limit detection
 
-After every navigation, check for:
-- URL redirect to `/challenge/` or `/accounts/login/` → **hard stop**, mark run as `blocked`, notify operator.
-- HTTP 429 or 5xx via response listener → backoff 30 min, then retry once; second failure stops the run.
-- "Try again later" toast (DOM text scan) → soft block, sleep 2h.
+Wired through `agent-browser` rather than a custom CDP listener. After every navigation:
+
+- `agent-browser get url` → if path contains `/challenge/`, `/accounts/login/`, or `/accounts/suspended/` → **hard stop**, mark run as `blocked`, notify operator.
+- `agent-browser network requests --filter '/api/v1/' --json` → scan for status 429 or 5xx; first hit triggers a 30-min backoff and one retry; second hit halts the run.
+- "Try again later" via `agent-browser get text body` substring scan → soft block, sleep 2h.
 - Suggestions panel returns 0 cards on 3+ consecutive profiles → likely throttled, stop.
 
 Each stop writes a `run_events` row with the cause so we can tune pacing from data.
@@ -299,10 +310,9 @@ Name matching is **decorative** for the candidate filter — i.e., a high-score 
 ```
 src/
   harness/
-    chrome.py            # CDP attach, reconnect logic
-    human.py             # click/scroll/type with jitter
+    browser.py           # subprocess wrapper around `agent-browser`; JSON parsing
     pacing.py            # delays, macro breaks, diurnal gate
-    detect.py            # checkpoint/429/throttle checks
+    detect.py            # checkpoint/429/throttle checks (consumes `network requests`)
   adapters/
     followers_list.py
     profile.py
