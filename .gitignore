@@ -1,0 +1,50 @@
+# Sensitive: PII and exported account data
+names.txt
+main_followers.json
+data/main_followers*.json
+
+# Crawled graph data (other people's info)
+data/graph.db
+data/graph.db-journal
+data/graph.db-wal
+data/graph.db-shm
+*.sqlite
+*.sqlite3
+
+# Browser session / cookies for burner account
+data/chrome-profile/
+chrome-profile/
+~/.ig-scrape-chrome-profile/
+
+# DOM snapshots from selector failures (may contain other users' content)
+data/snapshots/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+*.egg-info/
+build/
+dist/
+
+# Logs
+*.log
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
